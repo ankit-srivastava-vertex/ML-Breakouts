@@ -1,0 +1,106 @@
+# ML Breakouts — single source of truth for all knobs.
+
+# ─── Universe ────────────────────────────────────────────────────────────────
+universe:
+  source: nse_equity_l        # NSE main board only (derived from OHLCV cache)
+  drop_fno: false             # keep F&O names; they have best liquidity
+  mcap_min_cr: 200
+  mcap_max_cr: 45000
+  min_avg_dollar_vol_cr: 0.5  # Cr per day, 50d average
+
+# ─── Data ────────────────────────────────────────────────────────────────────
+data:
+  history_start: '2018-01-01' # ~7y of history for training
+  cache_dir: data/ohlcv
+
+# ─── Setup detector (rule-based primary) ─────────────────────────────────────
+# v2 (May 2026): hardened gates. Drops setups from ~242k to expected ~30-50k.
+setup:
+  lookback_days: 750
+  res_lookback_days: 600
+  base_min_days: 30
+  base_max_days: 400
+  res_band_pct: 0.035
+  proximity_max_pct: 0.05       # was 0.08
+  min_touches: 2
+  min_avg_volume: 50000
+  # v2 quality gates
+  enforce_quality_gates: true
+  max_atr_pct: 6.0              # ATR/Close * 100, last bar
+  max_rvol_dryup_5d: 1.20       # 5d/50d volume ratio
+  min_rs_3m_pct: 0.0            # stk 3m return - bench 3m return
+  max_dist_52w_pct: 12.0        # |R - 52w high| / 52w high * 100
+  min_dollar_vol_cr: 0.5        # 50d avg INR cr daily turnover
+
+# ─── Triple-barrier labeling ─────────────────────────────────────────────────
+# Tighter (v2): +3 ATR / -1 ATR / 10d. Drops base rate ~34% -> ~15%, makes
+# positives genuinely meaningful (real follow-through, not drift).
+labeling:
+  atr_period: 20
+  upper_barrier_atr: 3.0      # take-profit = entry + 3.0 * ATR
+  lower_barrier_atr: 1.0      # stop-loss   = entry - 1.0 * ATR
+  time_barrier_days: 10       # max hold (tighter — real breakouts move fast)
+  require_close_above_R: true # also require >=1 close above resistance R within first 5 bars
+
+# ─── Walk-forward CV ─────────────────────────────────────────────────────────
+cv:
+  scheme: walkforward         # walkforward | purged
+  n_splits: 6                 # used by purged
+  embargo_days: 15            # > time_barrier_days
+  test_window_months: 6
+  # Walk-forward params
+  train_min_days: 1095        # 3y warm-up
+  test_days: 180              # 6mo per fold
+  step_days: 90               # slide 3mo
+  # Holdout: last N months are NEVER seen in CV; reported as forward test.
+  holdout_months: 12
+
+# ─── Model ───────────────────────────────────────────────────────────────────
+model:
+  type: lightgbm
+  # Apply monotone constraints from src/model.DEFAULT_MONOTONE
+  # (huge overfit reducer when domain priors hold). Set false to disable.
+  monotone_constraints: true
+  monotone_overrides: {}
+  params:
+    objective: binary
+    metric: binary_logloss
+    # Optuna-tuned (see data/models/best_hparams.yaml) — 100 trials,
+    # objective: prec@top10 + 0.5*AP - 0.25*std, best_score=0.6164
+    learning_rate: 0.0313
+    num_leaves: 22
+    min_data_in_leaf: 136
+    feature_fraction: 0.6576
+    bagging_fraction: 0.5819
+    bagging_freq: 9
+    lambda_l1: 0.6600
+    lambda_l2: 0.0083
+    min_gain_to_split: 0.5887
+    scale_pos_weight: 0.9354
+    extra_trees: false
+    verbose: -1
+  num_boost_round: 1917
+  early_stopping_rounds: 100
+  calibration: isotonic
+  # Stacking ensemble (LGBM + XGBoost-DART + CatBoost → LR meta-learner)
+  stacking:
+    enabled: true
+    use_xgboost: true
+    use_catboost: false   # disabled: ~30+ min/fold on 190k rows w/o GPU
+  # Regime-conditioned models (split by bench_above_200dma)
+  regime_conditioned:
+    enabled: true
+  # R-multiple regression head (for Kelly sizing at inference)
+  rmultiple_regressor:
+    enabled: true
+
+# ─── Inference ───────────────────────────────────────────────────────────────
+# v2 thresholds: with tighter labels (+3/-1/10d) base rate is 12% so even
+# top-decile predictions cap around 0.22-0.30. Threshold sweep is tuned
+# to produce ~50 watchlist + ~10-20 trigger setups/day at current market.
+inference:
+  prob_threshold_watchlist: 0.15   # ~ top decile of predictions
+  prob_threshold_trigger: 0.22     # ~ top 2-5%, mean R positive in holdout
+  # Kelly sizing (used in daily scan when r_multiple regressor is available)
+  kelly_cap: 0.25            # max fraction of equity per trade
+  kelly_fractional: 0.5      # half-Kelly (safer in practice)

@@ -1,0 +1,96 @@
+name: Scenarios
+
+on:
+  schedule:
+    - cron: '0 13 * * 1-5' # Mon-Fri 16:37 IST (11:07 UTC)
+  workflow_dispatch:
+
+jobs:
+  test-run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Debug: print run context"
+        run: |
+          echo "Run context: GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
+          date -u
+          echo "UTC timestamp above"
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Create venv and install
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run script (dry-run)
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+        run: |
+          . .venv/bin/activate
+          python run_all.py 
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: market-reports-${{ github.run_number }}
+          path: |
+            market_analysis_report.xlsx
+            pct_down_report.xlsx
+            *_chart.html
+
+  send-email:
+    needs: test-run
+    runs-on: ubuntu-latest
+    steps:
+      - name: "Debug: print run context"
+        run: |
+          echo "Run context: GITHUB_EVENT_NAME=$GITHUB_EVENT_NAME"
+          date -u
+          echo "UTC timestamp above"
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+      - name: Create venv and install
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Check email secrets and possibly skip
+        env:
+          EMAIL_SMTP_SERVER: ${{ secrets.EMAIL_SMTP_SERVER }}
+          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_SUBJECT_PREFIX: ${{ secrets.EMAIL_SUBJECT_PREFIX }}
+        run: |
+          if [ -z "$EMAIL_APP_PASSWORD" ] || [ -z "$EMAIL_FROM" ] || [ -z "$EMAIL_TO" ] || [ -z "$EMAIL_USERNAME" ]; then
+            echo "Required email secrets missing; skipping send-email job."
+            exit 0
+          fi
+      - name: Run analysis (send email)
+        env:
+          ANGEL_API_KEY: ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_CODE: ${{ secrets.ANGEL_CLIENT_CODE }}
+          ANGEL_PIN: ${{ secrets.ANGEL_PIN }}
+          ANGEL_TOTP_SECRET: ${{ secrets.ANGEL_TOTP_SECRET }}
+          EMAIL_SMTP_SERVER: ${{ secrets.EMAIL_SMTP_SERVER }}
+          EMAIL_SMTP_PORT: ${{ secrets.EMAIL_SMTP_PORT }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_USE_TLS: 'true'
+          EMAIL_SUBJECT_PREFIX: ${{ secrets.EMAIL_SUBJECT_PREFIX }}
+        run: |
+          . .venv/bin/activate
+          python run_all.py

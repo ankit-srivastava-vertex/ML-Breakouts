@@ -1,0 +1,77 @@
+{
+    "Energy": {
+        "description": "Oil, Gas & Energy sector",
+        "constituents": [
+            "RELIANCE",
+            "ONGC",
+            "IOC",
+            "BPCL",
+            "GAIL",
+            "HINDPETRO",
+            "PETRONET",
+            "OIL",
+            "GUJGASLTD",
+            "IGL"
+        ]
+    },
+    "Transmission": {
+        "description": "Power Transmission & Distribution",
+        "constituents": [
+            "POWERGRID",
+            "ADANIENSOL",
+            "CESC",
+            "TORNTPOWER",
+            "TATAPOWER",
+            "JPPOWER",
+            "NHPC",
+            "SJVN",
+            "NTPC",
+            "JSWENERGY"
+        ]
+    },
+    "Defence": {
+        "description": "Defence & Aerospace",
+        "constituents": [
+            "HAL",
+            "BEL",
+            "BHEL",
+            "BDL",
+            "SOLARINDS",
+            "COCHINSHIP",
+            "GRSE",
+            "MAZDOCK",
+            "DATAPATTNS",
+            "PARAS"
+        ]
+    },
+    "IT Services": {
+        "description": "Information Technology Services",
+        "constituents": [
+            "TCS",
+            "INFY",
+            "HCLTECH",
+            "WIPRO",
+            "TECHM",
+            "LTIM",
+            "MPHASIS",
+            "COFORGE",
+            "PERSISTENT",
+            "TATAELXSI"
+        ]
+    },
+    "Pharma": {
+        "description": "Pharmaceuticals & Healthcare",
+        "constituents": [
+            "SUNPHARMA",
+            "DRREDDY",
+            "CIPLA",
+            "DIVISLAB",
+            "AUROPHARMA",
+            "LUPIN",
+            "TORNTPHARM",
+            "ALKEM",
+            "BIOCON",
+            "LAURUSLABS"
+        ]
+    }
+}

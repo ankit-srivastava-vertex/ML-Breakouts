@@ -1,0 +1,25 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+scipy>=1.11
+pyarrow>=14.0          # parquet I/O
+PyYAML>=6.0
+
+# Data ingestion
+jugaad-data>=0.28      # NSE bhavcopy seed (small, recent only)
+yfinance>=0.2.40       # primary historical OHLCV source
+requests>=2.31
+
+# Modeling
+lightgbm>=4.0          # primary model
+xgboost>=2.0           # stacking base learner (DART)
+catboost>=1.2          # stacking base learner (ordered boosting)
+scikit-learn>=1.3      # isotonic calibration, metrics, LR meta-learner
+optuna>=3.4            # hyperparameter search
+
+# Visualization
+plotly>=5.18
+matplotlib>=3.7
+
+# Optional Phase 8+
+# shap>=0.44
