@@ -51,6 +51,10 @@ Notes:
     dict (`rot_sector_*` keys) for joining into ML feature rows.
   * Refreshes are idempotent on the disk cache; pass
     `force_refresh_ohlcv=False` to reuse parquets.
+  * `compute_rotation()` accepts an optional `sym_to_sec` map so the
+    same engine can be reused for any group definition (this is what
+    `src/theme_rotation.py` exploits for custom thematic baskets read
+    from `src/index_constituents.json`).
 """
 
 from __future__ import annotations
@@ -427,11 +431,16 @@ def _rotation_core(asof: pd.Timestamp,
 def compute_rotation(asof: Optional[pd.Timestamp] = None,
                      sector_idx: Optional[pd.DataFrame] = None,
                      bench: Optional[pd.Series] = None,
-                     compute_breadth: bool = True) -> pd.DataFrame:
+                     compute_breadth: bool = True,
+                     sym_to_sec: Optional[dict] = None) -> pd.DataFrame:
     """Full rotation snapshot at `asof` (default = latest).
 
     Returns one row per sector with returns, RS, mom_score, rank,
     rank deltas (5d/20d) and member breadth above 50/200 DMA.
+
+    `sym_to_sec` lets callers (e.g. theme rotation) supply their own
+    {symbol -> group-name} map for breadth computation. When None, falls
+    back to the yfinance fundamentals sector map.
     """
     if sector_idx is None:
         sector_idx = load_sector_indices()
@@ -458,7 +467,8 @@ def compute_rotation(asof: Optional[pd.Timestamp] = None,
             df[f"rank_chg_{lbl}"] = np.nan
 
     if compute_breadth:
-        sym_to_sec = symbol_to_sector_map()
+        if sym_to_sec is None:
+            sym_to_sec = symbol_to_sector_map()
         sec_to_syms: dict[str, list[str]] = {}
         for sym, sec in sym_to_sec.items():
             sec_to_syms.setdefault(sec, []).append(sym)
