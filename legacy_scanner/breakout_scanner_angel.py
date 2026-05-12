@@ -23,14 +23,19 @@ Usage:
 
 import os
 import sys
+import re
 import math
 import argparse
 import datetime
 import warnings
+import urllib.request
+import urllib.parse
+import http.cookiejar
 from typing import Optional
 
 import numpy as np
 import pandas as pd
+from dotenv import load_dotenv
 
 warnings.filterwarnings("ignore")
 
@@ -63,16 +68,21 @@ PCT_DOWN_REPORT = os.path.join(SCRIPT_DIR, "multi_pct_down_report.xlsx")
 
 NIFTY50_BENCH = "^NSEI"  # Nifty 50 index (handled via Angel INDEX_OVERRIDES)
 
-# ─── Defaults / thresholds ──────────────────────────────────────────────────
-LOOKBACK_DAYS = 750        # ~ 3y of daily history (chart context)
-RES_LOOKBACK_DAYS = 600    # window used for resistance pivot search
-BASE_MIN_DAYS = 35         # min length of consolidation base
-BASE_MAX_DAYS = 400        # cap base length
-RES_BAND_PCT = 0.050       # touches counted within +/- 5% of resistance (was 3.5)
-PROXIMITY_MAX_PCT = 0.15   # consider stocks within 15% of resistance (was 8)
-PROXIMITY_MIN_PCT = -0.05  # also keep stocks up to 5% past breakout (was -3)
-MIN_TOUCHES = 2
-MIN_AVG_VOL = 50_000       # liquidity filter (avg 50d volume)
+# ─── Defaults / thresholds (v4.1) ───────────────────────────────────────────
+LOOKBACK_DAYS = 252        # v4.1: only consider last ~1 year of daily history
+RES_LOOKBACK_DAYS = 252    # v4.1: pivot/resistance search restricted to 1y
+MIN_HISTORY_DAYS = 45      # v4.3: min trading days required to evaluate a name
+BASE_MIN_DAYS = 20         # pattern matters more than duration
+BASE_MAX_DAYS = 180        # v4.1: cap base length at ~180 calendar days
+RES_BAND_PCT = 0.050       # touches counted within +/- 5% of resistance
+PROXIMITY_MAX_PCT = 0.04   # distance to resistance upper bound = +4%
+PROXIMITY_MIN_PCT = -0.05  # distance to resistance lower bound = -5%
+MIN_TOUCHES = 2            # detect_resistance qualification floor
+HC_MULTITOUCH_MIN = 2      # v4.1: pattern A requires >= 2 touches
+MAX_BASE_RANGE_PCT = 0.40  # reject any base wider than 40%
+RECENT_R_TEST_LOOKBACK = 50  # 50 sessions for recent resistance test
+RS_RISING_LOOKBACK = 50    # v4.4: rising RS-line over last 50 sessions
+MIN_AVG_VOL = 0            # v4.3: liquidity filter disabled
 WATCHLIST_MIN_SCORE = 50
 TRIGGER_MIN_SCORE = 65
 
@@ -110,6 +120,117 @@ def fetch_universe() -> list:
     universe = sorted(universe)
     print(f"  Total universe: {len(universe)} unique tickers\n")
     return universe
+
+
+# ─── Screener.in universe fetch ──────────────────────────────────────────────
+
+def _screener_login():
+    """Log in to screener.in, return authenticated opener or None."""
+    load_dotenv(os.path.join(SCRIPT_DIR, ".env"))
+
+    email = os.environ.get("SCREENER_USER", "")
+    password = os.environ.get("SCREENER_PASS", "")
+    if not email or not password:
+        print("  ERROR: SCREENER_USER / SCREENER_PASS not set in .env")
+        return None
+
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    login_url = "https://www.screener.in/login/"
+    cj = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(cj))
+
+    # GET login page for CSRF
+    req = urllib.request.Request(login_url, headers={"User-Agent": ua, "Accept": "text/html"})
+    html = opener.open(req, timeout=30).read().decode("utf-8", errors="ignore")
+    m = re.search(r'name="csrfmiddlewaretoken"\s+value="([^"]+)"', html)
+    if not m:
+        print("  ERROR: Could not find CSRF token on screener.in login page")
+        return None
+    csrf = m.group(1)
+
+    # POST login
+    data = urllib.parse.urlencode({
+        "csrfmiddlewaretoken": csrf,
+        "username": email,
+        "password": password,
+    }).encode("utf-8")
+    req2 = urllib.request.Request(login_url, data=data, headers={
+        "User-Agent": ua, "Referer": login_url,
+        "Content-Type": "application/x-www-form-urlencoded"})
+    resp = opener.open(req2, timeout=30)
+    body = resp.read().decode("utf-8", errors="ignore")
+    if "Please enter a correct" in body or "Invalid username" in body:
+        print("  ERROR: screener.in login failed — invalid credentials")
+        return None
+    print("  screener.in login OK")
+    return opener
+
+
+def _screener_fetch_names(opener, url: str) -> list:
+    """Fetch all pages of a screener.in screen, return list of stock names."""
+    ua = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+    names = []
+    page = 1
+    while True:
+        page_url = f"{url.rstrip('/')}/?page={page}" if page > 1 else url
+        req = urllib.request.Request(page_url, headers={
+            "User-Agent": ua, "Accept": "text/html",
+            "Referer": "https://www.screener.in/"})
+        html = opener.open(req, timeout=30).read().decode("utf-8", errors="ignore")
+        pattern = r'href="/company/([^/]+)/[^"]*"[^>]*>\s*([^<]+?)\s*</a>'
+        found = re.findall(pattern, html)
+        if not found:
+            break
+        for sym_slug, name in found:
+            names.append((sym_slug.strip().upper(), name.strip()))
+        page += 1
+        if f"page={page}" not in html and "Next" not in html:
+            break
+    return names
+
+
+def fetch_screener_universe(url: str) -> list:
+    """Fetch a screener.in screen and resolve names to Angel-compatible tickers.
+
+    Returns a list of yfinance-style tickers (e.g. 'RELIANCE.NS', '543745.BO').
+    Resolution strategy:
+      1. screener.in URL slugs are usually NSE symbols → try SYM.NS directly
+      2. Fall back to Angel scrip master name-match for any unresolved
+    """
+    opener = _screener_login()
+    if opener is None:
+        raise SystemExit("Cannot proceed without screener.in login")
+
+    print(f"  Fetching screen: {url}")
+    raw = _screener_fetch_names(opener, url)
+    if not raw:
+        raise SystemExit("No stocks found on screener.in (check URL or visibility)")
+    print(f"  Found {len(raw)} stocks on screener.in")
+
+    # screener.in slugs are typically NSE symbols (e.g. RELIANCE, HDFCBANK)
+    # Try .NS first; for numeric slugs (BSE scrip codes) try .BO
+    tickers = []
+    for slug, name in raw:
+        if slug.isdigit():
+            tickers.append(f"{slug}.BO")
+        else:
+            tickers.append(f"{slug}.NS")
+
+    tickers = sorted(set(tickers))
+    print(f"  Resolved to {len(tickers)} unique tickers")
+
+    # Save to Output/screener_data.xlsx for reference
+    out_dir = os.path.join(SCRIPT_DIR, os.pardir, "Output")
+    os.makedirs(out_dir, exist_ok=True)
+    out_path = os.path.join(out_dir, "screener_data.xlsx")
+    df = pd.DataFrame({"Name": [n for _, n in raw], "Ticker": [
+        f"{s}.BO" if s.isdigit() else f"{s}.NS" for s, _ in raw]})
+    df.to_excel(out_path, index=False, engine="openpyxl")
+    print(f"  Reference saved: {out_path}")
+
+    return tickers
 
 
 # ─── Data ingestion (Angel One SmartAPI) ───────────────────────────────────
@@ -224,6 +345,15 @@ def detect_resistance(df: pd.DataFrame) -> Optional[dict]:
         base_len = (df.index[-1] - base_start).days
         if base_len < BASE_MIN_DAYS:
             continue
+        # v4.1: cap base length at BASE_MAX_DAYS (180 calendar days). Older
+        # pivots are treated as historical context, not the active base.
+        if base_len > BASE_MAX_DAYS:
+            recent_pivots = [ts for ts in cluster_pivots_idx
+                             if (df.index[-1] - ts).days <= BASE_MAX_DAYS]
+            if len(recent_pivots) < MIN_TOUCHES:
+                continue
+            base_start = min(recent_pivots)
+            base_len = (df.index[-1] - base_start).days
         # Score: more touches better, longer base better, closer to 52w high better
         is_52w_high = R >= float(window["High"].max()) * 0.98
         candidates.append({
@@ -283,20 +413,31 @@ def linreg_slope(y: pd.Series) -> float:
     return float(np.polyfit(xx, yy, 1)[0])
 
 
-def ttm_squeeze_on(df: pd.DataFrame, n: int = 20, mult_bb: float = 2.0,
-                   mult_kc: float = 1.5) -> bool:
-    """True if Bollinger Bands inside Keltner Channels on latest bar."""
-    if len(df) < n + 5:
-        return False
-    c = df["Close"]
-    ma = c.rolling(n).mean()
-    sd = c.rolling(n).std()
-    bb_up = ma + mult_bb * sd
-    bb_dn = ma - mult_bb * sd
-    a = atr(df, n)
-    kc_up = ma + mult_kc * a
-    kc_dn = ma - mult_kc * a
-    return bool(bb_up.iloc[-1] < kc_up.iloc[-1] and bb_dn.iloc[-1] > kc_dn.iloc[-1])
+def rs_rising(df: pd.DataFrame, bench: pd.Series,
+              lookback: int = RS_RISING_LOOKBACK) -> dict:
+    """v4.0: True if the relative-strength line (stock_close / benchmark_close)
+    has a positive slope over the last `lookback` sessions. This is the
+    classic Mansfield/IBD RS line — independent of absolute RS magnitude;
+    it captures whether the stock is OUT-PERFORMING the index right now,
+    regardless of the longer-term gap. Returns dict {pass, slope, lookback}.
+    """
+    if bench is None or len(bench) < lookback or len(df) < lookback:
+        return {"pass": False, "slope": 0.0, "lookback": lookback}
+    common = df.index.intersection(bench.index)
+    if len(common) < lookback:
+        return {"pass": False, "slope": 0.0, "lookback": lookback}
+    s = df["Close"].reindex(common).tail(lookback).astype(float)
+    b = bench.reindex(common).tail(lookback).astype(float)
+    if (b <= 0).any() or s.isna().any() or b.isna().any():
+        return {"pass": False, "slope": 0.0, "lookback": lookback}
+    rs_line = (s / b).values
+    # Normalise so slope magnitude is comparable across stocks
+    rs_norm = rs_line / rs_line[0] if rs_line[0] > 0 else rs_line
+    x = np.arange(len(rs_norm), dtype=float)
+    slope = float(np.polyfit(x, rs_norm, 1)[0])
+    return {"pass": bool(slope > 0), "slope": slope, "lookback": lookback}
+
+
 
 
 # ─── Part 3: Composite "Coiled Spring" Score ────────────────────────────────
@@ -428,75 +569,6 @@ def compute_score(df: pd.DataFrame, res: dict, bench: pd.Series) -> dict:
 
 
 # ─── Part 4: Pocket Pivot ───────────────────────────────────────────────────
-
-def pocket_pivot(df: pd.DataFrame, R: float) -> bool:
-    """Strict O'Neil-style pocket pivot.
-
-    Required:
-      * Today vol > MAX volume of any DOWN day in the last 10 sessions
-      * Close > previous Close (true positive day, not just intra-day green)
-      * Close > Open
-      * Body >= 60% of total range (excludes dojis / rejection bars)
-      * Close in upper half of range (>= 0.5)
-      * Close >= 10-day SMA (in/above short trend, not bouncing off support)
-      * Close >= R*0.97 (within 3% of R or already through it)
-    """
-    if len(df) < 12:
-        return False
-    last = df.iloc[-1]
-    prev = df.iloc[-2]
-    prior10 = df.iloc[-11:-1]
-    down_days = prior10[prior10["Close"] < prior10["Close"].shift(1)]
-    if down_days.empty:
-        return False
-    max_down_vol = float(down_days["Volume"].max())
-    if last["Volume"] <= max_down_vol:
-        return False
-    if last["Close"] <= prev["Close"]:
-        return False
-    if last["Close"] <= last["Open"]:
-        return False
-    rng = last["High"] - last["Low"]
-    if rng <= 0:
-        return False
-    body = abs(last["Close"] - last["Open"]) / rng
-    if body < 0.60:
-        return False
-    pos_in_range = (last["Close"] - last["Low"]) / rng
-    if pos_in_range < 0.5:
-        return False
-    sma10 = df["Close"].rolling(10).mean().iloc[-1]
-    if last["Close"] < sma10:
-        return False
-    # Must be near or above R, not bouncing off support 5% below.
-    if last["Close"] < R * 0.97:
-        return False
-    if abs(R - last["Close"]) / last["Close"] > 0.05:
-        return False
-    return True
-
-
-# ─── Part 5: Confirmation layers ────────────────────────────────────────────
-
-def wyckoff_spring(df: pd.DataFrame, base_start: pd.Timestamp) -> bool:
-    base = df.loc[base_start:]
-    if len(base) < 20:
-        return False
-    base_low = base["Low"].iloc[:-5].min()
-    recent = base.iloc[-15:]
-    wicks = recent[(recent["Low"] < base_low) & (recent["Close"] > base_low)]
-    return not wicks.empty
-
-
-def obv_divergence(df: pd.DataFrame, base_start: pd.Timestamp) -> bool:
-    base = df.loc[base_start:]
-    if len(base) < 30:
-        return False
-    o = obv(base)
-    slope_ok = linreg_slope(o.tail(50)) > 0
-    obv_at_high = o.iloc[-1] >= o.tail(50).max() * 0.98
-    price_at_high = base["Close"].iloc[-1] >= base["Close"].tail(50).max() * 0.99
-    return bool(slope_ok and obv_at_high and not price_at_high)
 
 
 # ─── Part 6: Risk architecture ──────────────────────────────────────────────
@@ -698,8 +770,9 @@ def write_excel(rows: list, out_path: str):
                 hc = hc.sort_values("score", ascending=False)
                 cols_front = [
                     "symbol", "close", "resistance", "distance_pct",
-                    "score", "pocket_pivot", "ttm_squeeze", "rs_positive",
-                    "lvs", "rr", "stop", "target",
+                    "score", "hc_path", "pattern_multi_touch", "pattern_vcp",
+                    "pattern_cup_handle", "rs_rising_50d",
+                    "rr", "stop", "target",
                 ]
                 others = [c for c in hc.columns if c not in cols_front]
                 hc[cols_front + others].to_excel(
@@ -707,108 +780,34 @@ def write_excel(rows: list, out_path: str):
     print(f"  Excel written: {out_path}")
 
 
-# ─── Liquidity Vacuum Score (used by high-conviction rule) ───────────────
 
-def liquidity_vacuum_score(df: pd.DataFrame, R: float,
-                           base_start: pd.Timestamp,
-                           bins: int = 80) -> dict:
-    """Approximate Volume-at-Price using daily OHLC: each day distributes
-    its volume uniformly across (Low, High). Compare volume traded in
-    [R, R*1.15] vs [R*0.85, R].
-
-    LVS = 1 - (above_vol / below_vol). Higher = thinner air above.
-    """
-    base = df.loc[base_start:].copy()
-    if len(base) < 30:
-        return {"lvs": 0.0}
-
-    lo = R * 0.85
-    hi = R * 1.15
-    edges = np.linspace(lo, hi, bins + 1)
-    centers = 0.5 * (edges[:-1] + edges[1:])
-    bin_vol = np.zeros(bins)
-
-    for _, row in base.iterrows():
-        b_lo, b_hi, vol = float(row["Low"]), float(row["High"]), float(row["Volume"])
-        if b_hi <= b_lo or vol <= 0:
-            continue
-        oh = min(b_hi, hi)
-        ol = max(b_lo, lo)
-        if oh <= ol:
-            continue
-        per_unit = vol / (b_hi - b_lo)
-        for j in range(bins):
-            seg_lo = max(edges[j], ol)
-            seg_hi = min(edges[j + 1], oh)
-            if seg_hi > seg_lo:
-                bin_vol[j] += per_unit * (seg_hi - seg_lo)
-
-    above_mask = centers > R
-    above_vol = float(bin_vol[above_mask].sum())
-    below_vol = float(bin_vol[~above_mask].sum())
-    if below_vol <= 0:
-        return {"lvs": 0.0}
-    lvs = 1.0 - (above_vol / below_vol)
-    lvs = max(min(lvs, 1.0), -1.0)
-    return {"lvs": float(lvs)}
-
-
-# ─── Hard gates (v3.3, eliminative) ────────────────────────────────────────
+# ─── Hard gates (v4.3, eliminative) ────────────────────────────────────────
 # Built from the 11-chart audit (SUBAHOTELS, ZAPPFRESH, ADCOUNTY, FINBUD,
 # MSAFE, INDIAMART, KMEW, ALIVUS, PRIMECAB, JTLIND, ROLEXRINGS) + chart
 # follow-up (FIEMIND, INDOBORAX, SJS). Each gate eliminates a specific
 # chart pathology and is logged in the drop funnel for transparency.
 
 def stage2_uptrend(df: pd.DataFrame) -> dict:
-    """Stage-2 transition gate (Minervini, calibrated for recovering names).
+    """Stage-2 transition gate (v4.4, simplified).
 
-    The universe is, by construction, names 2-30% off their 52w high — so
-    demanding the full 50>150>200 stack throws out exactly the late-stage-1
-    transitions we want. Required (all): close>200DMA, 200DMA slope>=0
-    over 30d, close>50DMA, close>=25% above 52w low.
+    Required: close > 50DMA. The 200-DMA and 52w-low checks were removed
+    in v4.4 — they over-filtered recovering names in the universe.
     """
-    if len(df) < 220:
+    if len(df) < 60:
         return {"pass": False, "reason": "insufficient_history"}
     c = df["Close"]
     last = float(c.iloc[-1])
     ma50 = c.rolling(50).mean()
-    ma200 = c.rolling(200).mean()
-    if pd.isna(ma200.iloc[-1]) or ma200.iloc[-1] <= 0:
-        return {"pass": False, "reason": "no_ma200"}
-    if last <= ma200.iloc[-1]:
-        return {"pass": False, "reason": "below_ma200"}
-    if linreg_slope(ma200.tail(30)) < 0:
-        return {"pass": False, "reason": "ma200_falling"}
     if pd.isna(ma50.iloc[-1]) or last <= ma50.iloc[-1]:
         return {"pass": False, "reason": "below_ma50"}
-    lo52 = float(c.tail(252).min())
-    if lo52 > 0 and last < lo52 * 1.25:
-        return {"pass": False, "reason": "too_close_to_52w_low"}
     return {"pass": True, "reason": "ok"}
 
 
-def near_52w_high(df: pd.DataFrame, min_pct: float = 0.88) -> bool:
-    """True if last close >= min_pct * 52w high. Kills FIEMIND-style picks
-    that peaked months ago and are in a pullback (>=12% off ATH)."""
-    c = df["Close"]
-    if len(c) < 60:
-        return False
-    hi52 = float(c.tail(252).max())
-    return hi52 > 0 and float(c.iloc[-1]) >= hi52 * min_pct
 
-
-def ma50_slope_ok(df: pd.DataFrame, n: int = 20) -> bool:
-    """50DMA slope >= 0 over last n sessions. Kills rolling-over MAs."""
-    c = df["Close"]
-    if len(c) < 70:
-        return False
-    return linreg_slope(c.rolling(50).mean().tail(n)) >= 0
-
-
-def not_extended(df: pd.DataFrame, max_bar_gain: float = 0.08,
+def not_extended(df: pd.DataFrame, max_bar_gain: float = 0.05,
                  max_bar_atr_mult: float = 2.5) -> bool:
-    """True if entry isn't a vertical chase. Kills INDOBORAX +15% spike bar.
-       No |close-to-close| > 8% in last 5 bars AND last TR <= 2.5*ATR(20)."""
+    """True if entry isn't a vertical chase.
+       No |close-to-close| > 5% in last 5 bars AND last TR <= 2.5*ATR(20)."""
     c = df["Close"]
     if len(c) < 25:
         return False
@@ -833,7 +832,7 @@ def recent_failed_breakout(df: pd.DataFrame, R: float,
 
 
 def recent_r_test(df: pd.DataFrame, R: float, band_pct: float = 0.04,
-                  lookback: int = 90) -> dict:
+                  lookback: int = RECENT_R_TEST_LOOKBACK) -> dict:
     """At least one bar in last `lookback` whose High is within band_pct
     of R. Kills KMEW-style picks where R was drawn from old pivots and
     the current rally has not yet physically tested the level.
@@ -872,15 +871,6 @@ def base_metrics(df: pd.DataFrame, base_start, R: float) -> dict:
 
 
 # ─── Pattern detectors (boost score / inform HC rule) ────────────────────
-
-def flat_base_flag(df: pd.DataFrame, R: float, days: int = 25) -> bool:
-    """Trailing `days` range / R <= 8% (Minervini flat base)."""
-    seg = df.tail(days)
-    if len(seg) < days or R <= 0:
-        return False
-    rng = (float(seg["High"].max()) - float(seg["Low"].min())) / R
-    return bool(rng <= 0.08)
-
 
 def cup_and_handle(df: pd.DataFrame, base_start, R: float) -> bool:
     """Crude cup & handle (kept for diagnostics, NOT used in HC rule —
@@ -942,25 +932,51 @@ def vcp_contractions(df: pd.DataFrame, base_start) -> int:
     return n_contr
 
 
-def gap_fill_flag(df: pd.DataFrame, R: float, lookback: int = 60) -> bool:
-    """Down-gap whose top sits in [0.85R, 1.05R], later filled by a high
-       reaching the gap-top — sign of supply being absorbed at R."""
-    seg = df.tail(lookback)
-    if len(seg) < 5 or R <= 0:
+
+
+def w_pattern(df: pd.DataFrame, base_start, R: float) -> bool:
+    """v4.1: Double-bottom (W) pattern inside the base.
+
+    Geometry:
+      - Two swing-lows (L1, L2) within 4% of each other
+      - L2 occurs at least 5 bars after L1
+      - A middle peak between them >= 5% above the lower low
+      - Right side recovering: current close above 0.97 * middle-peak
+        OR current close already inside resistance proximity band
+    """
+    base = df.loc[base_start:]
+    if len(base) < 25 or R <= 0:
         return False
-    o = seg["Open"].values
-    h = seg["High"].values
-    pc = seg["Close"].shift(1).values
-    for i in range(1, len(seg) - 1):
-        if pd.isna(pc[i]):
-            continue
-        if not (o[i] < pc[i] * 0.97):
-            continue
-        gap_top = float(pc[i])
-        if not (0.85 * R <= gap_top <= 1.05 * R):
-            continue
-        if (h[i + 1:] >= gap_top).any():
-            return True
+    lows = base["Low"].values
+    highs = base["High"].values
+    n = len(lows)
+    k = 4
+    pivot_lows = []
+    for i in range(k, n - k):
+        if lows[i] == lows[i - k:i + k + 1].min():
+            pivot_lows.append((i, float(lows[i])))
+    if len(pivot_lows) < 2:
+        return False
+    last_close = float(df["Close"].iloc[-1])
+    for a in range(len(pivot_lows) - 1):
+        i1, l1 = pivot_lows[a]
+        for b in range(a + 1, len(pivot_lows)):
+            i2, l2 = pivot_lows[b]
+            if i2 - i1 < 5:
+                continue
+            lo, hi = (l1, l2) if l1 <= l2 else (l2, l1)
+            if (hi - lo) / lo > 0.04:
+                continue
+            mid_high = float(highs[i1 + 1:i2].max()) if i2 > i1 + 1 else 0.0
+            if mid_high <= 0:
+                continue
+            if (mid_high - lo) / lo < 0.05:
+                continue
+            near_neckline = last_close >= mid_high * 0.97
+            dist = (R - last_close) / last_close
+            near_R = (PROXIMITY_MIN_PCT <= dist <= PROXIMITY_MAX_PCT)
+            if near_neckline or near_R:
+                return True
     return False
 
 
@@ -984,24 +1000,20 @@ def scan(symbols: list, ohlcv: dict, bench: pd.Series,
         if sym not in ohlcv:
             _drop("no_data"); continue
         df = ohlcv[sym]
+        # v4.0 GATE 0: minimum history (100 trading days)
+        if len(df) < MIN_HISTORY_DAYS:
+            _drop("insufficient_history"); continue
         if df["Volume"].rolling(50).mean().iloc[-1] < MIN_AVG_VOL:
             _drop("liquidity"); continue
 
-        # ── HARD GATE 1: Stage-2 uptrend (Minervini) ──
+        # ── HARD GATE 1: Stage-2 uptrend (Minervini, MA200-based) ──
+        # NOTE v4.0: 50DMA-falling gate REMOVED per user request.
         if strict:
             s2 = stage2_uptrend(df)
             if not s2["pass"]:
                 _drop(f"stage2:{s2['reason']}"); continue
 
-        # ── HARD GATE 1b: 50DMA must not be rolling over ──
-        if strict and not ma50_slope_ok(df):
-            _drop("ma50_falling"); continue
-
-        # ── HARD GATE 1c: must be near 52w high ──
-        if strict and not near_52w_high(df, min_pct=0.88):
-            _drop("far_from_52w_high"); continue
-
-        # ── HARD GATE 1d: entry must not be extended ──
+        # ── HARD GATE 1d: entry must not be a vertical chase ──
         if strict and not not_extended(df):
             _drop("extended_entry"); continue
 
@@ -1011,68 +1023,72 @@ def scan(symbols: list, ohlcv: dict, bench: pd.Series,
                 _drop("no_resistance"); continue
             R = res["R"]
 
-            # ── HARD GATE 2: recent failed breakout ──
+            # ── HARD GATE 2: distance to resistance in [-5%, +4%] ──
+            if strict and not (PROXIMITY_MIN_PCT <= res["distance_pct"]
+                               <= PROXIMITY_MAX_PCT):
+                _drop("dist_out_of_band"); continue
+
+            # ── HARD GATE 2a: recent failed breakout ──
             if strict and recent_failed_breakout(df, R):
                 _drop("recent_failed_bo"); continue
 
-            # ── HARD GATE 2b: recent R touch (KMEW killer) ──
-            rrt = recent_r_test(df, R)
+            # ── HARD GATE 2b: recent R touch (50 sessions) ──
+            rrt = recent_r_test(df, R, lookback=RECENT_R_TEST_LOOKBACK)
             if strict and not rrt["pass"]:
                 _drop(f"r_test:{rrt['reason']}"); continue
 
-            # ── HARD GATE 3: base tightness ──
+            # ── HARD GATE 3: base width <= 40% (no wider bases) ──
             base_geo = base_metrics(df, res["base_start"], R)
-            if strict and base_geo["range_pct"] > 0.30:
+            if strict and base_geo["range_pct"] > MAX_BASE_RANGE_PCT:
                 _drop("base_too_wide"); continue
 
-            # ── HARD GATE 4: base volume dry-up ──
+            # ── HARD GATE 4: rising relative strength over last 50 sessions ──
+            rs = rs_rising(df, bench, lookback=RS_RISING_LOOKBACK)
+            if strict and not rs["pass"]:
+                _drop("rs_not_rising_50d"); continue
+
+            # Volume ratio kept as informational column only (no longer a gate)
             v50 = float(df["Volume"].rolling(50).mean().iloc[-1])
             base_window = df["Volume"].iloc[-28:-3]
             v_base = float(base_window.mean()) if len(base_window) else v50
             v_ratio = (v_base / v50) if v50 > 0 else 1.0
-            if strict and v_ratio > 1.00:
-                _drop("no_volume_dryup"); continue
 
             score = compute_score(df, res, bench)
             if score["score"] < min_score:
                 _drop("low_score"); continue
 
+            # ── Pattern detection (priority: multi_touch > vcp > W > C&H) ──
             n_vcp = vcp_contractions(df, res["base_start"])
-            flags = {
-                "pocket_pivot":   pocket_pivot(df, R),
-                "ttm_squeeze":    ttm_squeeze_on(df),
-                "wyckoff_spring": wyckoff_spring(df, res["base_start"]),
-                "obv_divergence": obv_divergence(df, res["base_start"]),
-                "flat_base":      flat_base_flag(df, R),
-                "cup_handle":     cup_and_handle(df, res["base_start"], R),
-                "vcp":            bool(n_vcp >= 2),
-                "gap_fill":       gap_fill_flag(df, R),
-            }
-            lvs = liquidity_vacuum_score(df, R, res["base_start"])
+            pattern_multitouch = bool(res["touches"] >= HC_MULTITOUCH_MIN)
+            pattern_vcp = bool(n_vcp >= 2)
+            pattern_w = bool(w_pattern(df, res["base_start"], R))
+            pattern_ch = bool(cup_and_handle(df, res["base_start"], R))
+            if pattern_multitouch:
+                pattern_label = "multi_touch"
+            elif pattern_vcp:
+                pattern_label = "vcp"
+            elif pattern_w:
+                pattern_label = "w_pattern"
+            elif pattern_ch:
+                pattern_label = "cup_handle"
+            else:
+                pattern_label = ""
+            pattern_ok = bool(pattern_multitouch or pattern_vcp
+                              or pattern_w or pattern_ch)
+
             risk = risk_plan(df, res)
             distance_pct_value = round(res["distance_pct"] * 100, 2)
-            rs_positive = score["rs"] > 0
 
-            # === High-conviction trigger v3.5 (combo-search calibrated) ===
-            # Grid search over n=247 decided backtest signals showed the
-            # minimal subset that retains the best precision (50% wr,
-            # +0.91% expectancy) is just three filters. Other conditions
-            # were redundant or anti-edge:
-            #   * vcp detector: 7.7% wr (broken, dropped from pattern_ok)
-            #   * ttm_squeeze:  17.3% wr (anti-edge)
-            #   * dist range:   25.8% wr (already captured by pocket_pivot)
-            #   * voldry/score: noise on top of pocket_pivot
-            base_tight = (base_geo["range_pct"] <= 0.15
-                          or base_geo["trailing_pct"] <= 0.08)
-            high_conviction = bool(
-                flags["pocket_pivot"]
-                and lvs["lvs"] >= 0.4
-                and base_tight
-            )
+            # === HIGH-CONVICTION (v4.0) ===
+            # All hard gates already enforced above. HC requires that the
+            # setup also matches at least one of the three approved patterns.
+            high_conviction = pattern_ok
+            hc_path = pattern_label  # "multi_touch" | "vcp" | "cup_handle" | ""
 
             rows.append({
                 "symbol": sym,
                 "high_conviction": high_conviction,
+                "hc_path": hc_path,
                 "score": score["score"],
                 "close": round(float(df["Close"].iloc[-1]), 2),
                 "resistance": round(R, 2),
@@ -1088,10 +1104,13 @@ def scan(symbols: list, ohlcv: dict, bench: pd.Series,
                 "vcr_raw": score["vcr_raw"],
                 "vdu_raw": score["vdu_raw"],
                 "higher_lows": score["higher_lows"],
-                "rs_positive": rs_positive,
-                "lvs": round(lvs["lvs"], 3),
+                "rs_rising_50d": rs["pass"],
+                "rs_slope_50d": round(rs["slope"], 6),
+                "pattern_multi_touch": pattern_multitouch,
+                "pattern_vcp": pattern_vcp,
+                "pattern_w": pattern_w,
+                "pattern_cup_handle": pattern_ch,
                 "n_vcp": n_vcp,
-                **flags,
                 **risk,
             })
         except Exception as e:
@@ -1104,7 +1123,7 @@ def scan(symbols: list, ohlcv: dict, bench: pd.Series,
 # ─── Main ───────────────────────────────────────────────────────────────────
 
 def main():
-    p = argparse.ArgumentParser(description="Breakout Scanner v3.3")
+    p = argparse.ArgumentParser(description="Breakout Scanner v4.3")
     p.add_argument("--max", type=int, default=0,
                    help="cap universe size (0 = all)")
     p.add_argument("--min-score", type=float, default=WATCHLIST_MIN_SCORE)
@@ -1115,6 +1134,15 @@ def main():
                    help="disable v3.3 hard gates (diagnostic v1 funnel)")
     p.add_argument("--high-conviction", action="store_true",
                    help="only output HC picks (v3.3 calibrated rule)")
+    p.add_argument("--symbols-csv", type=str, default="",
+                   help="path to CSV with a 'ticker' column to use as universe "
+                        "(overrides multi_pct_down_report.xlsx)")
+    p.add_argument("--screener-url", type=str, default="",
+                   help="screener.in screen URL to fetch universe from "
+                        "(overrides multi_pct_down_report.xlsx)")
+    p.add_argument("--out-tag", type=str, default="",
+                   help="suffix appended to output Excel filenames "
+                        "(e.g. 'watchlist' -> breakout_watchlist_watchlist.xlsx)")
     args = p.parse_args()
     strict = not args.no_strict
 
@@ -1127,14 +1155,28 @@ def main():
     sys.stderr = _tee_err
 
     print("=" * 70)
-    print(f"  BREAKOUT SCANNER v3.5 — {TODAY.strftime('%d-%b-%Y')}")
-    print(f"  Source: {os.path.basename(PCT_DOWN_REPORT)}")
+    print(f"  BREAKOUT SCANNER v4.3 — {TODAY.strftime('%d-%b-%Y')}")
+    if args.symbols_csv:
+        print(f"  Source: {args.symbols_csv} (custom CSV)")
+    elif args.screener_url:
+        print(f"  Source: screener.in screen")
+    else:
+        print(f"  Source: {os.path.basename(PCT_DOWN_REPORT)}")
     print(f"  Mode  : {'STRICT (v3.3 hard gates ON)' if strict else 'DIAGNOSTIC (gates OFF)'}")
     if args.high_conviction:
         print("  Filter: HIGH-CONVICTION only (v3.3 rule)")
     print("=" * 70)
 
-    tickers = fetch_universe()
+    if args.symbols_csv:
+        scsv = pd.read_csv(args.symbols_csv)
+        if "ticker" not in scsv.columns:
+            raise SystemExit(f"--symbols-csv {args.symbols_csv} must have a 'ticker' column")
+        tickers = sorted({str(t).strip() for t in scsv["ticker"].dropna() if str(t).strip()})
+        print(f"  Custom universe: {len(tickers)} tickers from {args.symbols_csv}")
+    elif args.screener_url:
+        tickers = fetch_screener_universe(args.screener_url)
+    else:
+        tickers = fetch_universe()
     if args.max > 0:
         tickers = tickers[:args.max]
         print(f"  Universe capped to {len(tickers)}")
@@ -1156,28 +1198,38 @@ def main():
     print(f"\n  Candidates surviving all gates (score >= {effective_min_score}): {len(rows)}")
 
     if rows:
-        n_pp   = sum(1 for r in rows if r["pocket_pivot"])
-        n_fb   = sum(1 for r in rows if r["flat_base"])
-        n_ch   = sum(1 for r in rows if r["cup_handle"])
-        n_vcp  = sum(1 for r in rows if r["vcp"])
-        n_gf   = sum(1 for r in rows if r["gap_fill"])
-        n_sq   = sum(1 for r in rows if r["ttm_squeeze"])
-        n_rs   = sum(1 for r in rows if r["rs_positive"])
-        n_d    = sum(1 for r in rows if -2.0 <= r["distance_pct"] <= 5.0)
-        n_lvs  = sum(1 for r in rows if r["lvs"] >= 0.4)
-        n_bt   = sum(1 for r in rows if r["base_range_pct"] <= 15.0
-                                       or r["trail25_range_pct"] <= 8.0)
-        n_vdu  = sum(1 for r in rows if r["vol_ratio_base"] <= 0.95)
+        n_mt   = sum(1 for r in rows if r["pattern_multi_touch"])
+        n_vcp  = sum(1 for r in rows if r["pattern_vcp"])
+        n_w    = sum(1 for r in rows if r["pattern_w"])
+        n_ch   = sum(1 for r in rows if r["pattern_cup_handle"])
+        n_rsr  = sum(1 for r in rows if r["rs_rising_50d"])
+        n_d    = sum(1 for r in rows if PROXIMITY_MIN_PCT * 100
+                                       <= r["distance_pct"]
+                                       <= PROXIMITY_MAX_PCT * 100)
+        n_b40  = sum(1 for r in rows if r["base_range_pct"] <= 40.0)
         n_hc   = sum(1 for r in rows if r["high_conviction"])
-        print("  HC v3.3 condition pass rates:")
-        print(f"    pattern: flat_base={n_fb} cup_handle={n_ch} vcp={n_vcp}"
-              f" pocket_pivot={n_pp} | gap_fill={n_gf} ttm_squeeze={n_sq}")
-        print(f"    rs_positive={n_rs}, dist[-2,5]={n_d}, lvs>=0.4={n_lvs},"
-              f" base_tight(<=15%|trail<=8%)={n_bt}, vol_dryup<=0.95={n_vdu}")
-        print(f"    HIGH-CONVICTION (v3.5: pocket_pivot & lvs>=0.4 & base_tight): {n_hc}")
+        n_hc_mt = sum(1 for r in rows if r.get("hc_path") == "multi_touch")
+        n_hc_vcp = sum(1 for r in rows if r.get("hc_path") == "vcp")
+        n_hc_w = sum(1 for r in rows if r.get("hc_path") == "w_pattern")
+        n_hc_ch = sum(1 for r in rows if r.get("hc_path") == "cup_handle")
+        print("  HC v4.3 condition pass rates:")
+        print(f"    patterns: multi_touch={n_mt}, vcp={n_vcp},"
+              f" w_pattern={n_w}, cup_handle={n_ch}")
+        print(f"    rs_rising_50d={n_rsr}, dist[-5,+4]={n_d},"
+              f" base<=40%={n_b40}")
+        print(f"    HIGH-CONVICTION total: {n_hc}  "
+              f"(multi_touch={n_hc_mt}, vcp={n_hc_vcp},"
+              f" w={n_hc_w}, cup_handle={n_hc_ch})")
+        print(f"      Priority order: multi_touch > vcp > w_pattern > cup_handle")
+        print(f"      All HC names already passed: stage2 (>MA50),"
+              f" not_extended, dist[-5,+4], r_test_50, base<=40%,"
+              f" rs_rising_50d")
 
     if rows:
         excel_full = os.path.join(SCRIPT_DIR, "breakout_watchlist.xlsx")
+        if args.out_tag:
+            excel_full = os.path.join(SCRIPT_DIR,
+                                      f"breakout_watchlist_{args.out_tag}.xlsx")
         write_excel(rows, excel_full)
 
     if args.high_conviction:
@@ -1193,6 +1245,9 @@ def main():
 
     if args.high_conviction:
         excel_path = os.path.join(SCRIPT_DIR, "breakout_high_conviction.xlsx")
+        if args.out_tag:
+            excel_path = os.path.join(
+                SCRIPT_DIR, f"breakout_high_conviction_{args.out_tag}.xlsx")
         write_excel(rows, excel_path)
 
     rows_sorted = sorted(rows, key=lambda r: (not r.get("high_conviction"),
@@ -1209,10 +1264,11 @@ def main():
         score = compute_score(df, res, bench)
         risk = risk_plan(df, res)
         flags = {
-            "pocket_pivot": r["pocket_pivot"],
-            "ttm_squeeze": r["ttm_squeeze"],
-            "wyckoff_spring": r["wyckoff_spring"],
-            "obv_divergence": r["obv_divergence"],
+            "multi_touch": r.get("pattern_multi_touch", False),
+            "vcp": r.get("pattern_vcp", False),
+            "w_pattern": r.get("pattern_w", False),
+            "cup_handle": r.get("pattern_cup_handle", False),
+            "rs_rising_50d": r.get("rs_rising_50d", False),
         }
         prefix = "HC_" if r.get("high_conviction") else ""
         out = os.path.join(charts_dir, f"{prefix}{sym}_breakout.html")
@@ -1220,9 +1276,9 @@ def main():
     print(f"  Charts saved to: {charts_dir}")
 
     print("\n  Top 10 (HC first, then by score):")
-    cols = ["symbol", "high_conviction", "score", "close", "resistance",
-            "distance_pct", "base_range_pct", "vol_ratio_base",
-            "flat_base", "vcp", "pocket_pivot", "rs_positive", "lvs", "rr"]
+    cols = ["symbol", "high_conviction", "hc_path", "score", "close",
+            "resistance", "distance_pct", "touches", "base_days",
+            "base_range_pct", "rs_rising_50d", "rr"]
     top = pd.DataFrame(rows_sorted[:10])[cols]
     print(top.to_string(index=False))
     print("\nDONE.")

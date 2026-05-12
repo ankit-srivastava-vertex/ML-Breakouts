@@ -113,10 +113,13 @@ Stage 4 - EARLY filters applied immediately after each pull
         keep only if  last_close > mean(Close[-200:])
       Long-term uptrend filter.
 
-  4h) Higher lows (~ last 30-45 days):
-        keep only if  min(Low[-15:]) > min(Low[-45:-15])
-      Base-building filter: recent swing low must be higher than the
-      prior swing low. Drops names still making fresh local lows.
+  4h) Higher lows (swing-low staircase, last 50 sessions):
+        Find the absolute low in the last 50 sessions ("base").
+        Detect swing-low pivots (low <= N bars on each side, N=3)
+        after the base.  Keep only if at least 2 successive swing
+        lows form an ascending sequence above the base.
+      Base-building filter: confirms a staircase of rising lows
+      rather than just comparing two window minimums.
 
 Stage 5 - Market cap
   5a) Mcap data required  [ALL universes]:
@@ -157,7 +160,7 @@ Always-on per-ticker filters (hard-coded in _analyze_one):
   - Drawdown duration: DISABLED (value still tracked)
   - RS vs NIFTY 500: stock 3M return > index 3M return
   - Above 200-DMA
-  - Higher lows over the last ~30-45 days
+  - Higher lows: >=2 ascending swing lows in last 50 sessions
   - 1Y runup cap: drop if 1Y return > 54%
   - Mcap data required: drop if yfinance has no mcap/shares data
 Only the F&O drop and the mcap band are matrix-toggled.
@@ -215,9 +218,11 @@ MCAP_MAX_CR = 34000
 MAX_1Y_RUNUP_PCT = 54.0
 MIN_LAST_CLOSE = 45.0      # drop sub-Rs.45 names (penny / illiquid)
 DMA200_WINDOW = 200        # require last_close > 200-day MA
-HL_RECENT_WIN = 15         # higher-lows: recent window length (~ last 3 wks)
-HL_PRIOR_WIN = 30          # higher-lows: prior window length (~ 30-45d back)
+HL_LOOKBACK = 50           # higher-lows: sessions to scan for base + pivots
+HL_SWING_ORDER = 3         # pivot detection: low must be <= N bars each side
+HL_MIN_HIGHER_LOWS = 2     # require at least N ascending swing lows after base
 LOW52W_BUFFER_PCT = 20.0   # require last_close >= 52W_low * (1 + 20%)
+RS_SESSIONS = 50           # RS comparison window in trading sessions
 RS_INDEX_TICKER = "^CRSLDX"  # NIFTY 500 (Yahoo)
 DD_LOOKBACK_M = 5          # drawdown duration: window to find pivot high
 DD_MIN_DAYS = 90           # min days since 5M high (not too fresh)
@@ -412,6 +417,21 @@ def _months_ago(n):
     return TODAY - datetime.timedelta(days=int(round(float(n) * 30.44)))
 
 
+def _find_swing_lows(lows_arr, order=3):
+    """Return list of (index, value) for swing-low pivots.
+    A swing low at position i satisfies:
+      lows_arr[i] <= min(lows_arr[i-order:i])
+      lows_arr[i] <= min(lows_arr[i+1:i+order+1])
+    """
+    swings = []
+    for i in range(order, len(lows_arr) - order):
+        left_min = min(lows_arr[i - order:i])
+        right_min = min(lows_arr[i + 1:i + order + 1])
+        if lows_arr[i] <= left_min and lows_arr[i] <= right_min:
+            swings.append((i, float(lows_arr[i])))
+    return swings
+
+
 def _get_market_cap_cr(yf, ticker, last_close=None):
     """Yahoo `fast_info.market_cap` is None for most NSE/BSE tickers,
     so we compute mcap = shares * last_close."""
@@ -553,16 +573,14 @@ def _analyze_one(yf, ticker, symbol, name, start_date,
     if pct_1y is not None and pct_1y > max_1y_runup:
         return {"_drop": "runup_%.0f" % pct_1y}
 
-    # ----- EARLY FILTER 2b: RS vs NIFTY 500 over 3M ----------------------
+    # ----- EARLY FILTER 2b: RS vs NIFTY 500 over 50 sessions -------------
     if index_ret_3m is not None:
-        cutoff_3m = pd.Timestamp(_months_ago(3))
-        closes_3m = closes[closes.index >= cutoff_3m]
-        if not closes_3m.empty:
-            base_3m = float(closes_3m.iloc[0])
-            if base_3m > 0:
-                ret_3m = (last_close - base_3m) / base_3m * 100.0
-                if ret_3m <= index_ret_3m:
-                    return {"_drop": "rs_%.0f" % ret_3m}
+        if len(closes) >= RS_SESSIONS:
+            base_rs = float(closes.iloc[-RS_SESSIONS])
+            if base_rs > 0:
+                ret_rs = (last_close - base_rs) / base_rs * 100.0
+                if ret_rs <= index_ret_3m:
+                    return {"_drop": "rs_%.0f" % ret_rs}
 
     # ----- EARLY FILTER 3: above 200-DMA ---------------------------------
     if len(closes) < DMA200_WINDOW:
@@ -571,23 +589,42 @@ def _analyze_one(yf, ticker, symbol, name, start_date,
     if dma200 <= 0 or last_close <= dma200:
         return {"_drop": "below_200dma"}
 
-    # ----- EARLY FILTER 4: higher lows over last ~30-45 days -------------
-    # Compare min(low) of recent window vs min(low) of prior window.
+    # ----- EARLY FILTER 4: higher-lows staircase (last 50 sessions) ------
+    # Find the base (absolute low in last HL_LOOKBACK sessions), then
+    # detect swing-low pivots after the base and require at least
+    # HL_MIN_HIGHER_LOWS ascending swing lows.
     lows = df["Low"].dropna() if "Low" in df.columns else closes
-    need = HL_RECENT_WIN + HL_PRIOR_WIN
-    if len(lows) < need:
+    if len(lows) < HL_LOOKBACK:
         return {"_drop": "short_lows"}
-    recent_low = float(lows.iloc[-HL_RECENT_WIN:].min())
-    prior_low = float(lows.iloc[-(HL_RECENT_WIN + HL_PRIOR_WIN):
-                                -HL_RECENT_WIN].min())
-    if recent_low <= prior_low:
+    lows_window = lows.iloc[-HL_LOOKBACK:]
+    lows_vals = lows_window.values.astype(float).tolist()
+    base_pos = int(lows_window.values.argmin())
+    base_val = lows_vals[base_pos]
+    # Swing-low pivots after the base
+    all_swings = _find_swing_lows(lows_vals, order=HL_SWING_ORDER)
+    swings_after = [(i, v) for i, v in all_swings if i > base_pos]
+    # Build greedy ascending sequence from the base
+    higher_lows = []
+    prev_val = base_val
+    for _i, v in swings_after:
+        if v > prev_val:
+            higher_lows.append(round(v, 2))
+            prev_val = v
+    # Tentative: if min of the last SWING_ORDER bars is above the
+    # latest confirmed level, count it as an additional higher low.
+    tail_low = float(min(lows_vals[-HL_SWING_ORDER:]))
+    if tail_low > prev_val:
+        higher_lows.append(round(tail_low, 2))
+    hl_count = len(higher_lows)
+    hl_base = round(base_val, 2)
+    if hl_count < HL_MIN_HIGHER_LOWS:
         return {"_drop": "no_higher_lows"}
 
-    # Market cap: always require mcap data; band only when apply_mcap=True
+    # Market cap: band only when apply_mcap=True; no longer drop on missing
     mcap_cr = _get_market_cap_cr(yf, ticker, last_close=last_close)
-    if mcap_cr is None:
-        return {"_drop": "no_mcap"}
     if apply_mcap:
+        if mcap_cr is None:
+            return {"_drop": "no_mcap"}
         if not (mcap_min <= mcap_cr <= mcap_max):
             return {"_drop": "mcap_%.0f" % mcap_cr}
 
@@ -619,6 +656,9 @@ def _analyze_one(yf, ticker, symbol, name, start_date,
             "%s High" % label: round(hi, 2),
             "%s High Date" % label: hi_date,
             "Pct From High": round(pct, 2),
+            "HL Count": hl_count,
+            "HL Base": hl_base,
+            "HL Values": ", ".join(str(v) for v in higher_lows),
         }
     return {"_drop": None, "periods": periods}
 
@@ -719,8 +759,8 @@ def screen_universe(yf, name, tickers, fno_set, mcap_min, mcap_max,
           % (LOW52W_BUFFER_PCT, counts["low52w"]))
     print("  DD filter              : disabled (-%d would have dropped)"
           % counts["dd"])
-    print("  After RS vs NIFTY500   : -%d dropped (idx 3M=%s)"
-          % (counts["rs"],
+    print("  After RS vs NIFTY500   : -%d dropped (idx %dS=%s)"
+          % (counts["rs"], RS_SESSIONS,
              ("%.2f%%" % index_ret_3m) if index_ret_3m is not None
              else "n/a"))
     print("  After 1Y runup >%g%%   : -%d dropped"
@@ -736,8 +776,8 @@ def screen_universe(yf, name, tickers, fno_set, mcap_min, mcap_max,
               "-%d no-mcap)" % (mcap_min, mcap_max, counts["pass"],
                                 counts["mcap_drop"], counts["no_mcap"]))
     else:
-        print("  Mcap band             : skipped  (-%d no-mcap dropped)"
-              % counts["no_mcap"])
+        print("  Mcap band             : skipped")
+        print("  No-mcap data          : %d (kept anyway)" % counts["no_mcap"])
     print("  Errors / no-data       : %d" % counts["errors"])
 
     # Build per-period DataFrames
@@ -845,11 +885,11 @@ def run(out_dir, skip, min_pct, max_pct, max_symbols, workers,
     fno_set = load_fno_symbols()
     print("   F&O symbols: %d" % len(fno_set))
 
-    # NIFTY 500 3M return for relative-strength filter.
+    # NIFTY 500 return over RS_SESSIONS trading sessions for RS filter.
     index_ret_3m = None
     try:
-        print("-> Fetching NIFTY 500 (%s) for RS baseline ..."
-              % RS_INDEX_TICKER)
+        print("-> Fetching NIFTY 500 (%s) for RS baseline (%d sessions) ..."
+              % (RS_INDEX_TICKER, RS_SESSIONS))
         idx_df = yf.download(RS_INDEX_TICKER,
                              start=_months_ago(4).isoformat(),
                              progress=False, auto_adjust=False,
@@ -858,14 +898,13 @@ def run(out_dir, skip, min_pct, max_pct, max_symbols, workers,
             if isinstance(idx_df.columns, pd.MultiIndex):
                 idx_df.columns = idx_df.columns.get_level_values(0)
             idx_closes = idx_df["Close"].dropna()
-            cutoff_3m = pd.Timestamp(_months_ago(3))
-            idx_3m = idx_closes[idx_closes.index >= cutoff_3m]
-            if not idx_3m.empty:
-                base = float(idx_3m.iloc[0])
+            if len(idx_closes) >= RS_SESSIONS:
+                base = float(idx_closes.iloc[-RS_SESSIONS])
                 last = float(idx_closes.iloc[-1])
                 if base > 0:
                     index_ret_3m = (last - base) / base * 100.0
-                    print("   NIFTY 500 3M return: %.2f%%" % index_ret_3m)
+                    print("   NIFTY 500 %dS return: %.2f%%"
+                          % (RS_SESSIONS, index_ret_3m))
     except Exception as _e:
         print("   WARN  Could not fetch NIFTY 500 (%s); RS filter off."
               % _e)
