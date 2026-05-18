@@ -16,6 +16,11 @@ How it works:
         `legacy_scanner/data_provider.py` (Angel One SmartAPI primary;
         jugaad / yfinance fallback only when ANGEL_ONLY=False).
 
+Pipeline mode (default):
+  After the OHLCV refresh, automatically chains:
+    02_build_training_set → 03_train_model → 04_evaluate
+  Use `--only` to run just this step without chaining.
+
 Data sources:
   Angel One SmartAPI (primary), jugaad-data / yfinance (fallback).
   Legacy NSE bhavcopy archives are WAF-blocked and no longer used.
@@ -24,8 +29,10 @@ Outputs:
   data/ohlcv/<SYMBOL>.parquet  (Open / High / Low / Close / Volume)
 
 How to run:
+  python scripts/01_build_dataset.py                  # full pipeline (01→02→03→04)
+  python scripts/01_build_dataset.py --smoke           # quick smoke test through full pipeline
+  python scripts/01_build_dataset.py --only            # just step 01, no chaining
   python scripts/01_build_dataset.py --start 2018-01-01
-  python scripts/01_build_dataset.py --smoke              # tiny sanity run
 
 Cadence:
   Quarterly (refresh as part of routine retrain). Daily updates are
@@ -40,6 +47,7 @@ Notes:
 import sys
 import argparse
 import datetime
+import importlib.util
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -59,6 +67,8 @@ def main():
                     help="Angel One batch size (tickers per request)")
     ap.add_argument("--smoke", action="store_true",
                     help="quick run: 10 symbols, 6 months")
+    ap.add_argument("--only", action="store_true",
+                    help="run only step 01 (skip chaining 02→03→04)")
     args = ap.parse_args()
 
     cfg = load_config()
@@ -105,6 +115,50 @@ def main():
             print(f"  {s}: {len(df)} rows, "
                   f"{df.index.min().date()} → {df.index.max().date()}, "
                   f"last close = {df['Close'].iloc[-1]:.2f}")
+
+    # ── Pipeline chaining: 02 → 03 → 04 ──
+    if args.only:
+        print("\n  --only: skipping pipeline chaining.")
+        return
+
+    scripts_dir = Path(__file__).resolve().parent
+    chain = [
+        ("02_build_training_set", "02_build_training_set.py",
+         ["--max-symbols", "20"] if args.smoke else []),
+        ("03_train_model", "03_train_model.py", []),
+        ("04_evaluate", "04_evaluate.py", []),
+    ]
+
+    for mod_name, filename, extra_argv in chain:
+        script_path = scripts_dir / filename
+        if not script_path.exists():
+            print(f"\n  ERROR: {script_path} not found — aborting chain.")
+            return
+        print("\n" + "=" * 70)
+        print(f"  CHAINING → {filename}")
+        print("=" * 70)
+        saved_argv = sys.argv
+        sys.argv = [str(script_path)] + extra_argv
+        try:
+            spec = importlib.util.spec_from_file_location(mod_name,
+                                                          str(script_path))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+        except SystemExit as e:
+            if e.code not in (None, 0):
+                print(f"\n  ERROR: {filename} exited with code {e.code} "
+                      f"— aborting chain.")
+                return
+        except Exception as e:
+            print(f"\n  ERROR: {filename} failed: {e} — aborting chain.")
+            return
+        finally:
+            sys.argv = saved_argv
+
+    print("\n" + "=" * 70)
+    print("  FULL PIPELINE COMPLETE (01 → 02 → 03 → 04)")
+    print("=" * 70)
 
 
 if __name__ == "__main__":
